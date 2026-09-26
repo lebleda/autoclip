@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple, Optional
 from .video_processor import VideoProcessor
 from .subtitle_processor import SubtitleProcessor
 from .ffmpeg_utils import get_ffmpeg_path, get_ffprobe_path
+from .lossless_cut_wrapper import LosslessCutWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +336,84 @@ class VideoEditor:
         except Exception as e:
             logger.error(f"创建预览片段失败: {e}")
             return []
+    
+    def edit_video_by_lossless_trim(self,
+                                    video_path: Path,
+                                    start_time: float,
+                                    end_time: float,
+                                    output_path: Path,
+                                    codec: str = "copy") -> Dict:
+        """Use lossless cutting to trim video.
+        
+        Args:
+            video_path: 原始视频路径
+            start_time: 开始时间（秒）
+            end_time: 结束时间（秒）
+            output_path: 输出视频路径
+            codec: 编码模式，'copy' 为流复制(真正lossless)，'libx264' 为重新编码
+            
+        Returns:
+            编辑结果信息
+        """
+        try:
+            logger.info(f"开始lossless剪辑视频: {video_path}, 时间范围 {start_time}s - {end_time}s")
+            
+            success = LosslessCutWrapper.trim_video_lossless(
+                video_path, start_time, end_time, output_path, codec
+            )
+            
+            if success:
+                final_duration = LosslessCutWrapper._get_video_duration(output_path)
+                result = {
+                    'success': True,
+                    'originalVideoPath': str(video_path),
+                    'editedVideoPath': str(output_path),
+                    'startTime': start_time,
+                    'endTime': end_time,
+                    'duration': end_time - start_time,
+                    'finalDuration': final_duration,
+                    'codec': codec
+                }
+                logger.info(f"Lossless剪辑完成: {output_path}")
+                return result
+            else:
+                return {
+                    'success': False,
+                    'error': 'Lossless剪辑失败'
+                }
+                
+        except Exception as e:
+            logger.error(f"Lossless剪辑失败: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    @staticmethod
+    def _get_video_duration(video_path: Path) -> float:
+        """获取视频时长"""
+        try:
+            ffprobe_bin = get_ffprobe_path()
+            cmd = [
+                ffprobe_bin,
+                '-v', 'quiet',
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                str(video_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                return duration
+            else:
+                logger.warning(f"获取视频时长失败")
+                return 0.0
+                
+        except Exception as e:
+            logger.error(f"获取视频时长异常: {e}")
+            return 0.0
     
     def validate_edit_operations(self, subtitle_data: List[Dict], 
                                deleted_segments: List[str]) -> Dict:

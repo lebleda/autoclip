@@ -15,6 +15,7 @@ from enum import Enum
 import requests
 from dataclasses import dataclass
 from .ffmpeg_utils import get_ffmpeg_path
+from .llm_client import LLMClient  # Add LLM client import
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 class SpeechRecognitionMethod(str, Enum):
     """语音识别方法枚举"""
     WHISPER_LOCAL = "whisper_local"
+    WHISPERX = "whisperx"
     OPENAI_API = "openai_api"
     AZURE_SPEECH = "azure_speech"
     GOOGLE_SPEECH = "google_speech"
@@ -200,6 +202,7 @@ class SpeechRecognizer:
     
     def __init__(self, config: Optional[SpeechRecognitionConfig] = None):
         self.config = config or SpeechRecognitionConfig()
+        self.llm_client = LLMClient()
         self.available_methods = self._check_available_methods()
     
     def _check_available_methods(self) -> Dict[SpeechRecognitionMethod, bool]:
@@ -208,6 +211,9 @@ class SpeechRecognizer:
         
         # 检查本地Whisper
         methods[SpeechRecognitionMethod.WHISPER_LOCAL] = self._check_whisper_availability()
+        
+        # 检查 whisperX
+        methods[SpeechRecognitionMethod.WHISPERX] = self._check_whisperx_availability()
         
         # 检查OpenAI API
         methods[SpeechRecognitionMethod.OPENAI_API] = self._check_openai_availability()
@@ -233,6 +239,15 @@ class SpeechRecognizer:
             return whisper_runtime.is_installed()
         except Exception:
             logger.warning("本地Whisper未安装或不可用")
+            return False
+    
+    def _check_whisperx_availability(self) -> bool:
+        """检查 whisperX 是否已安装。"""
+        try:
+            import importlib.util
+            return importlib.util.find_spec("whisperx") is not None
+        except Exception:
+            logger.warning("whisperX未安装或不可用")
             return False
     
     def _check_openai_availability(self) -> bool:
@@ -355,6 +370,8 @@ class SpeechRecognizer:
         try:
             if config.method == SpeechRecognitionMethod.WHISPER_LOCAL:
                 return self._generate_subtitle_whisper_local(video_path, output_path, config)
+            elif config.method == SpeechRecognitionMethod.WHISPERX:
+                return self._generate_subtitle_whisperx(video_path, output_path, config)
             elif config.method == SpeechRecognitionMethod.OPENAI_API:
                 return self._generate_subtitle_openai_api(video_path, output_path, config)
             elif config.method == SpeechRecognitionMethod.AZURE_SPEECH:
@@ -535,56 +552,57 @@ class SpeechRecognizer:
             logger.warning("本地 faster-whisper 生成字幕失败: %s: %s", type(e).__name__, e)
             raise SpeechRecognitionError(describe_whisper_failure(e)) from e
     
-    def _generate_subtitle_openai_api(self, video_path: Path, output_path: Path, 
-                                    config: SpeechRecognitionConfig) -> Path:
-        """使用OpenAI API生成字幕"""
-        if not self.available_methods[SpeechRecognitionMethod.OPENAI_API]:
-            raise SpeechRecognitionError("OpenAI API不可用，请设置OPENAI_API_KEY环境变量")
-        
+def _generate_subtitle_whisperx(self, video_path: Path, output_path: Path,
+                               config: SpeechRecognitionConfig) -> Path:
+        """使用 whisperX 生成字幕，支持说话人分离"""
         try:
-            logger.info(f"开始使用OpenAI API生成字幕: {video_path}")
+            import whisperx
             
-            # 这里需要实现OpenAI API调用
-            # 由于需要额外的依赖，这里先抛出异常
-            raise SpeechRecognitionError("OpenAI API功能暂未实现，请使用本地Whisper")
+            if not importlib.util.find_spec("whisperx"):
+                raise SpeechRecognitionError(
+                    "whisperX 运行时未安装。请运行: pip install whisperx"
+                )
             
+            if not video_path.exists():
+                raise SpeechRecognitionError(f"视频文件不存在: {video_path}")
+            if video_path.stat().st_size == 0:
+                raise SpeechRecognitionError(f"视频文件为空: {video_path}")
+            
+            language = None if config.language == LanguageCode.AUTO else str(config.language).split("-")[0]
+            
+            # 加载模型
+            model = whisperx.load_model(config.model, device="cpu", compute_type="int8")
+            
+            # 转写
+            audio = whisperx.load_audio(str(video_path))
+            segments, info = model.transcribe(audio, language=language)
+            
+            # 获取说话人分离（如果配置了）
+            if config.enable_speaker_diarization:
+                try:
+                    diarize_segments = whisperx.diarize_utils.diarize_segments(
+                        model, audio, min_speakers=2, max_speakers=5
+                    )
+                    segments = whisperx.assignment.assign_segments(segments, diarize_segments)
+                except Exception as e:
+                    logger.warning(f"说话人分离失败: {e}，将继续而不分离说话人")
+            
+            # 转换为 SRT 格式
+            cues = [seg for seg in segments if (seg.get("text") or "").strip()]
+            if not cues:
+                raise SpeechRecognitionError("whisperX 未识别出任何语音内容")
+            
+            srt_content = self._segments_to_srt(cues)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(srt_content, encoding="utf-8")
+            logger.info(f"whisperX 字幕生成成功: {output_path}")
+            return output_path
+            
+        except SpeechRecognitionError:
+            raise
         except Exception as e:
-            error_msg = f"OpenAI API生成字幕时发生错误: {e}"
-            logger.error(error_msg)
-            raise SpeechRecognitionError(error_msg)
-    
-    def _generate_subtitle_azure_speech(self, video_path: Path, output_path: Path, 
-                                      config: SpeechRecognitionConfig) -> Path:
-        """使用Azure Speech Services生成字幕"""
-        if not self.available_methods[SpeechRecognitionMethod.AZURE_SPEECH]:
-            raise SpeechRecognitionError("Azure Speech Services不可用，请设置AZURE_SPEECH_KEY和AZURE_SPEECH_REGION环境变量")
-        
-        try:
-            logger.info(f"开始使用Azure Speech Services生成字幕: {video_path}")
-            
-            # 这里需要实现Azure Speech Services调用
-            raise SpeechRecognitionError("Azure Speech Services功能暂未实现，请使用本地Whisper")
-            
-        except Exception as e:
-            error_msg = f"Azure Speech Services生成字幕时发生错误: {e}"
-            logger.error(error_msg)
-            raise SpeechRecognitionError(error_msg)
-    
-    def _generate_subtitle_google_speech(self, video_path: Path, output_path: Path, 
-                                       config: SpeechRecognitionConfig) -> Path:
-        """使用Google Speech-to-Text生成字幕"""
-        if not self.available_methods[SpeechRecognitionMethod.GOOGLE_SPEECH]:
-            raise SpeechRecognitionError("Google Speech-to-Text不可用，请设置GOOGLE_APPLICATION_CREDENTIALS或GOOGLE_SPEECH_API_KEY环境变量")
-        
-        try:
-            logger.info(f"开始使用Google Speech-to-Text生成字幕: {video_path}")
-            
-            # 这里需要实现Google Speech-to-Text调用
-            raise SpeechRecognitionError("Google Speech-to-Text功能暂未实现，请使用本地Whisper")
-            
-        except Exception as e:
-            error_msg = f"Google Speech-to-Text生成字幕时发生错误: {e}"
-            logger.error(error_msg)
+            logger.warning("whisperX 生成字幕失败: %s: %s", type(e).__name__, e)
+            raise SpeechRecognitionError(f"whisperX 生成字幕失败: {str(e)}")
             raise SpeechRecognitionError(error_msg)
     
     def _generate_subtitle_aliyun_speech(self, video_path: Path, output_path: Path, 
